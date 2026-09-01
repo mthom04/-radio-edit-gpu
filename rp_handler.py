@@ -24,21 +24,37 @@ Input (job["input"]):
 
 Output:
     {
-        "vocals_b64": "<base64 WAV>",
-        "instrumental_b64": "<base64 WAV>",
+        "vocals_url": "<short-lived download link, WAV>",
+        "instrumental_url": "<short-lived download link, WAV>",
         "words": [{"word": str, "start": float, "end": float}, ...]
     }
 
     On failure:
     {"error": "<message>"}
+
+Why URLs instead of raw audio: RunPod caps a job's response at 10 MB for
+/run. A full-quality vocals+instrumental WAV pair for even a short song
+blows past that easily, and RunPod just silently drops the oversized
+response (job shows COMPLETED with no output). So instead, both stems get
+uploaded to a RunPod Network Volume (accessed here via its S3-compatible
+API) and we hand back short-lived presigned download links -- tiny JSON
+response, no size limit problem, regardless of song length.
+
+Required environment variables (set on the endpoint, not in this file):
+    RUNPOD_S3_ENDPOINT_URL   e.g. https://s3api-us-nc-2.runpod.io
+    RUNPOD_S3_REGION         e.g. us-nc-2
+    RUNPOD_S3_BUCKET         the network volume ID, e.g. gkxo0dk9dg
+    RUNPOD_S3_ACCESS_KEY     from RunPod Settings -> S3 API Keys
+    RUNPOD_S3_SECRET_KEY     from RunPod Settings -> S3 API Keys
 """
 
 import base64
-import shutil
+import os
 import traceback
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import boto3
 import runpod
 
 from clean_song import (
@@ -48,6 +64,28 @@ from clean_song import (
     transcribe_vocals,
 )
 
+PRESIGNED_URL_TTL_SECONDS = 3600  # 1 hour -- plenty of time for worker.py to download
+
+
+def _s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ["RUNPOD_S3_ENDPOINT_URL"],
+        region_name=os.environ["RUNPOD_S3_REGION"],
+        aws_access_key_id=os.environ["RUNPOD_S3_ACCESS_KEY"],
+        aws_secret_access_key=os.environ["RUNPOD_S3_SECRET_KEY"],
+    )
+
+
+def _upload_and_get_url(s3, local_path: Path, key: str) -> str:
+    bucket = os.environ["RUNPOD_S3_BUCKET"]
+    s3.upload_file(str(local_path), bucket, key)
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=PRESIGNED_URL_TTL_SECONDS,
+    )
+
 
 def _decode_audio_input(audio_b64: str, audio_ext: str, work_dir: Path) -> Path:
     raw = base64.b64decode(audio_b64)
@@ -56,12 +94,9 @@ def _decode_audio_input(audio_b64: str, audio_ext: str, work_dir: Path) -> Path:
     return in_path
 
 
-def _encode_audio_output(path: Path) -> str:
-    return base64.b64encode(path.read_bytes()).decode("ascii")
-
-
 def handler(job):
     job_input = job.get("input", {}) or {}
+    job_id = job.get("id", "unknown_job")
 
     audio_b64 = job_input.get("audio_b64")
     if not audio_b64:
@@ -85,9 +120,15 @@ def handler(job):
 
             words = transcribe_vocals(vocals_path, model_size=whisper_model)
 
+            s3 = _s3_client()
+            vocals_url = _upload_and_get_url(s3, vocals_path, f"{job_id}/vocals.wav")
+            instrumental_url = _upload_and_get_url(
+                s3, instrumental_path, f"{job_id}/instrumental.wav"
+            )
+
             return {
-                "vocals_b64": _encode_audio_output(vocals_path),
-                "instrumental_b64": _encode_audio_output(instrumental_path),
+                "vocals_url": vocals_url,
+                "instrumental_url": instrumental_url,
                 "words": words,
             }
 
