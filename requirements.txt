@@ -2,3 +2,4 @@ runpod
 pydub
 demucs
 faster-whisper
+boto3
