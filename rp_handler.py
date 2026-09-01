@@ -24,21 +24,23 @@ Input (job["input"]):
 
 Output:
     {
-        "vocals_url": "<short-lived download link, WAV>",
-        "instrumental_url": "<short-lived download link, WAV>",
+        "vocals_key": "<job_id>/vocals.wav",
+        "instrumental_key": "<job_id>/instrumental.wav",
         "words": [{"word": str, "start": float, "end": float}, ...]
     }
 
     On failure:
     {"error": "<message>"}
 
-Why URLs instead of raw audio: RunPod caps a job's response at 10 MB for
+Why keys instead of raw audio: RunPod caps a job's response at 10 MB for
 /run. A full-quality vocals+instrumental WAV pair for even a short song
 blows past that easily, and RunPod just silently drops the oversized
 response (job shows COMPLETED with no output). So instead, both stems get
-uploaded to a RunPod Network Volume (accessed here via its S3-compatible
-API) and we hand back short-lived presigned download links -- tiny JSON
-response, no size limit problem, regardless of song length.
+uploaded to a RunPod Network Volume (via its S3-compatible API) and we
+hand back just the storage keys (paths) -- tiny JSON response, no size
+limit problem. The downloading side (worker.py) uses the same S3
+credentials to fetch them directly, rather than a presigned "guest link"
+-- RunPod's S3-compatible storage doesn't reliably honor presigned URLs.
 
 Required environment variables (set on the endpoint, not in this file):
     RUNPOD_S3_ENDPOINT_URL   e.g. https://s3api-us-nc-2.runpod.io
@@ -64,8 +66,6 @@ from clean_song import (
     transcribe_vocals,
 )
 
-PRESIGNED_URL_TTL_SECONDS = 3600  # 1 hour -- plenty of time for worker.py to download
-
 
 def _s3_client():
     return boto3.client(
@@ -77,14 +77,10 @@ def _s3_client():
     )
 
 
-def _upload_and_get_url(s3, local_path: Path, key: str) -> str:
+def _upload(s3, local_path: Path, key: str) -> str:
     bucket = os.environ["RUNPOD_S3_BUCKET"]
     s3.upload_file(str(local_path), bucket, key)
-    return s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=PRESIGNED_URL_TTL_SECONDS,
-    )
+    return key
 
 
 def _decode_audio_input(audio_b64: str, audio_ext: str, work_dir: Path) -> Path:
@@ -121,14 +117,14 @@ def handler(job):
             words = transcribe_vocals(vocals_path, model_size=whisper_model)
 
             s3 = _s3_client()
-            vocals_url = _upload_and_get_url(s3, vocals_path, f"{job_id}/vocals.wav")
-            instrumental_url = _upload_and_get_url(
+            vocals_key = _upload(s3, vocals_path, f"{job_id}/vocals.wav")
+            instrumental_key = _upload(
                 s3, instrumental_path, f"{job_id}/instrumental.wav"
             )
 
             return {
-                "vocals_url": vocals_url,
-                "instrumental_url": instrumental_url,
+                "vocals_key": vocals_key,
+                "instrumental_key": instrumental_key,
                 "words": words,
             }
 
