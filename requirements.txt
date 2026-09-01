@@ -1,0 +1,4 @@
+runpod
+pydub
+demucs
+faster-whisper
