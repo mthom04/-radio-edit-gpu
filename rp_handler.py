@@ -16,31 +16,45 @@ today.
 
 Input (job["input"]):
     {
-        "audio_b64": "<base64-encoded audio file, any format ffmpeg reads>",
+        "input_key": "<key of the source audio, already uploaded to S3>",
         "audio_ext": "mp3",            # optional, default "mp3"
         "whisper_model": "medium",     # optional, default "medium"
-        "demucs_model": "htdemucs"     # optional, default "htdemucs"
+        "demucs_model": "htdemucs",    # optional, default "htdemucs" (ignored for voice_only)
+        "job_type": "song"             # optional, "song" (default) or "voice_only"
     }
 
-Output:
+Output (job_type == "song"):
     {
         "vocals_key": "<job_id>/vocals.wav",
         "instrumental_key": "<job_id>/instrumental.wav",
         "words": [{"word": str, "start": float, "end": float}, ...]
     }
 
+Output (job_type == "voice_only"):
+    {
+        "audio_key": "<job_id>/audio.wav",
+        "words": [{"word": str, "start": float, "end": float}, ...]
+    }
+
     On failure:
     {"error": "<message>"}
 
-Why keys instead of raw audio: RunPod caps a job's response at 10 MB for
-/run. A full-quality vocals+instrumental WAV pair for even a short song
-blows past that easily, and RunPod just silently drops the oversized
-response (job shows COMPLETED with no output). So instead, both stems get
-uploaded to a RunPod Network Volume (via its S3-compatible API) and we
-hand back just the storage keys (paths) -- tiny JSON response, no size
-limit problem. The downloading side (worker.py) uses the same S3
-credentials to fetch them directly, rather than a presigned "guest link"
--- RunPod's S3-compatible storage doesn't reliably honor presigned URLs.
+Why S3 on both sides: RunPod caps a job's request/response bodies at
+10 MB each. A base64-encoded input file blows past that for anything
+longer than a couple minutes (this is what broke on a 20-min interview
+upload), and a full-quality vocals+instrumental WAV pair blows past it
+on the way back out too. So both directions go through a RunPod Network
+Volume (via its S3-compatible API): worker.py uploads the source audio
+and hands us a key instead of raw bytes, and we hand back storage keys
+for our output instead of raw bytes. worker.py uses the same S3
+credentials to fetch results directly, rather than a presigned "guest
+link" -- RunPod's S3-compatible storage doesn't reliably honor presigned
+URLs.
+
+voice_only mode (interviews / spoken-word content with no music bed):
+skips separate_stems entirely and transcribes the normalized input
+directly, since there's nothing to isolate vocals from. Saves the
+Demucs GPU pass and returns a single audio key instead of a stem pair.
 
 Required environment variables (set on the endpoint, not in this file):
     RUNPOD_S3_ENDPOINT_URL   e.g. https://s3api-us-nc-2.runpod.io
@@ -50,7 +64,6 @@ Required environment variables (set on the endpoint, not in this file):
     RUNPOD_S3_SECRET_KEY     from RunPod Settings -> S3 API Keys
 """
 
-import base64
 import os
 import traceback
 from pathlib import Path
@@ -83,10 +96,10 @@ def _upload(s3, local_path: Path, key: str) -> str:
     return key
 
 
-def _decode_audio_input(audio_b64: str, audio_ext: str, work_dir: Path) -> Path:
-    raw = base64.b64decode(audio_b64)
+def _download_audio_input(s3, input_key: str, audio_ext: str, work_dir: Path) -> Path:
+    bucket = os.environ["RUNPOD_S3_BUCKET"]
     in_path = work_dir / f"input.{audio_ext}"
-    in_path.write_bytes(raw)
+    s3.download_file(bucket, input_key, str(in_path))
     return in_path
 
 
@@ -94,21 +107,33 @@ def handler(job):
     job_input = job.get("input", {}) or {}
     job_id = job.get("id", "unknown_job")
 
-    audio_b64 = job_input.get("audio_b64")
-    if not audio_b64:
-        return {"error": "Missing required input field: audio_b64"}
+    input_key = job_input.get("input_key")
+    if not input_key:
+        return {"error": "Missing required input field: input_key"}
 
     audio_ext = job_input.get("audio_ext", "mp3").lstrip(".")
     whisper_model = job_input.get("whisper_model", "medium")
     demucs_model = job_input.get("demucs_model", "htdemucs")
+    job_type = job_input.get("job_type", "song")
 
     with TemporaryDirectory(dir="/tmp") as tmp:
         work_dir = Path(tmp)
         try:
-            input_path = _decode_audio_input(audio_b64, audio_ext, work_dir)
+            s3 = _s3_client()
+            input_path = _download_audio_input(s3, input_key, audio_ext, work_dir)
             validate_audio(input_path)
 
             normalized = normalize_audio(input_path, work_dir)
+
+            if job_type == "voice_only":
+                # No music bed to separate from -- transcribe the
+                # normalized input directly and skip Demucs entirely.
+                words = transcribe_vocals(normalized, model_size=whisper_model)
+                audio_key = _upload(s3, normalized, f"{job_id}/audio.wav")
+                return {
+                    "audio_key": audio_key,
+                    "words": words,
+                }
 
             vocals_path, instrumental_path = separate_stems(
                 normalized, work_dir, model=demucs_model
@@ -116,7 +141,6 @@ def handler(job):
 
             words = transcribe_vocals(vocals_path, model_size=whisper_model)
 
-            s3 = _s3_client()
             vocals_key = _upload(s3, vocals_path, f"{job_id}/vocals.wav")
             instrumental_key = _upload(
                 s3, instrumental_path, f"{job_id}/instrumental.wav"
