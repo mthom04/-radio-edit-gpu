@@ -245,16 +245,30 @@ def transcribe_vocals_openai(vocals_path: Path, api_key: str) -> list[dict]:
 PUNCT_STRIP = ".,!?\"'\u2018\u2019\u201c\u201d-*\u2026~"
 
 
-def transcribe_vocals(vocals_path: Path, model_size: str = "medium") -> list[dict]:
+def transcribe_vocals(vocals_path: Path, model_size: str = "medium", vad_filter: bool = True, vad_parameters: dict | None = None) -> list[dict]:
     """
     Returns a list of {"word": str, "start": float, "end": float}.
     Requires: pip install faster-whisper
 
     Settings tuned for music vocals (not clean speech):
-    - vad_filter=True: skips truly silent stretches instead of letting the
-      model invent giant multi-second "words" spanning instrumental gaps.
+    - vad_filter=True (default): skips truly silent stretches instead of
+      letting the model invent giant multi-second "words" spanning
+      instrumental gaps. Pass False to disable VAD entirely and transcribe
+      every second of audio with no speech/silence judgment at all --
+      used as the second opinion in transcribe_vocals_double_pass().
     - condition_on_previous_text=False: stops the model from getting stuck
       repeating a bad guess over and over (the "-h -h -h" hallucination loop).
+      This is what keeps vad_filter=False from spiraling into a repeated-
+      hallucination loop on instrumental-only stretches.
+    - vad_parameters: only used when vad_filter=True. The defaults
+      (threshold=0.5, min_silence_duration_ms=2000) are tuned for clean
+      spoken-word audio. Against music, a quick or quieter burst of words
+      -- several curse words back to back, said fast -- can score below
+      the default threshold and get silently dropped, so the words never
+      even reach the transcript to be checked against the wordlist. Pass a
+      looser dict (lower threshold, shorter min_silence_duration_ms, extra
+      speech_pad_ms) to catch more; pass None to fall back to
+      faster-whisper's own defaults.
     """
     from faster_whisper import WhisperModel
 
@@ -262,7 +276,8 @@ def transcribe_vocals(vocals_path: Path, model_size: str = "medium") -> list[dic
     segments, _info = model.transcribe(
         str(vocals_path),
         word_timestamps=True,
-        vad_filter=True,
+        vad_filter=vad_filter,
+        vad_parameters=vad_parameters if vad_filter else None,
         condition_on_previous_text=False,
     )
 
@@ -278,6 +293,53 @@ def transcribe_vocals(vocals_path: Path, model_size: str = "medium") -> list[dic
                 "end": round(w.end, 3),
             })
     return words
+
+
+def merge_transcripts(primary: list[dict], secondary: list[dict], tolerance: float = 0.5) -> list[dict]:
+    """
+    Unions two word lists from separate transcription passes into one,
+    without duplicating words both passes agreed on. A word from
+    `secondary` is only added if there's no word in `primary` with the same
+    text within `tolerance` seconds of it -- otherwise it's treated as the
+    same word already captured. Result is sorted by start time.
+    """
+    merged = list(primary)
+    for w in secondary:
+        is_dup = any(
+            p["word"] == w["word"] and abs(p["start"] - w["start"]) <= tolerance
+            for p in primary
+        )
+        if not is_dup:
+            merged.append(w)
+    merged.sort(key=lambda w: w["start"])
+    return merged
+
+
+def transcribe_vocals_double_pass(vocals_path: Path, model_size: str = "medium") -> list[dict]:
+    """
+    Song jobs only (post-separation vocals stem) -- runs the whole track
+    through transcription TWICE with different VAD settings and merges the
+    results, so a word dropped by one pass's VAD judgment call has a second
+    chance to be caught by the other. Costs roughly 2x the transcription
+    time of a single pass; not used for voice_only jobs, where a single
+    well-tuned pass over clean spoken audio is already reliable and the
+    extra GPU time isn't worth it.
+
+    Pass 1: the tuned-for-music settings (lower threshold, catches more).
+    Pass 2: VAD disabled entirely -- transcribes every second of audio with
+    no speech/silence judgment at all, as a maximally inclusive second
+    opinion. condition_on_previous_text=False (set inside transcribe_vocals)
+    keeps this from spiraling into a hallucination loop on instrumental-only
+    stretches.
+    """
+    pass1 = transcribe_vocals(
+        vocals_path,
+        model_size=model_size,
+        vad_filter=True,
+        vad_parameters=dict(threshold=0.35, min_silence_duration_ms=500, speech_pad_ms=300),
+    )
+    pass2 = transcribe_vocals(vocals_path, model_size=model_size, vad_filter=False)
+    return merge_transcripts(pass1, pass2)
 
 
 # --------------------------------------------------------------------------

@@ -77,6 +77,7 @@ from clean_song import (
     normalize_audio,
     separate_stems,
     transcribe_vocals,
+    transcribe_vocals_double_pass,
 )
 
 
@@ -128,7 +129,16 @@ def handler(job):
             if job_type == "voice_only":
                 # No music bed to separate from -- transcribe the
                 # normalized input directly and skip Demucs entirely.
-                words = transcribe_vocals(normalized, model_size=whisper_model)
+                # Single pass only (not double_pass): this is clean spoken
+                # audio, not music, so the tuned VAD settings alone are
+                # reliable and a second full pass isn't worth the extra
+                # GPU time here.
+                words = transcribe_vocals(
+                    normalized,
+                    model_size=whisper_model,
+                    vad_filter=True,
+                    vad_parameters=dict(threshold=0.35, min_silence_duration_ms=500, speech_pad_ms=300),
+                )
                 audio_key = _upload(s3, normalized, f"{job_id}/audio.wav")
                 return {
                     "audio_key": audio_key,
@@ -139,7 +149,12 @@ def handler(job):
                 normalized, work_dir, model=demucs_model
             )
 
-            words = transcribe_vocals(vocals_path, model_size=whisper_model)
+            # Song jobs: run the full double pass over the whole vocals
+            # stem -- worth the ~2x transcription time here since music
+            # vocals are harder for VAD to judge correctly than clean
+            # speech, and this is where dropped words have actually shown
+            # up (a burst of curse words said fast/quiet mid-song).
+            words = transcribe_vocals_double_pass(vocals_path, model_size=whisper_model)
 
             vocals_key = _upload(s3, vocals_path, f"{job_id}/vocals.wav")
             instrumental_key = _upload(
